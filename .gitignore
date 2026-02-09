@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+*.egg-info/
+dist/
+build/
+
+# Training logs and checkpoints
+logs/
+*.log
+debug_out/
+debug_shots/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# MuJoCo
+*.mjb
+
+# Temporary files
+*.tmp
+*.bak
+*~
+
+# OS
+.DS_Store
+Thumbs.db
