@@ -47,8 +47,8 @@ class KukaTableTennisEnv(gym.Env):
     """
     Stage1: 只训练“碰到球拍 (hit)”
     - episode 在 hit_event 时立即终止
-    - reward 强化靠近目标击球点、速度对齐、hit 大奖励
-    - 不统计过网/落台/成功
+    - reward 强化靠近球、相对速度对齐、hit 大奖励
+    - 不统计过网/落台/成功，避免日志混乱
     """
     metadata = {"render_modes": ["rgb_array", "human"], "render_fps": 50}
 
@@ -57,9 +57,6 @@ class KukaTableTennisEnv(gym.Env):
         self.cfg = cfg
         self.render_mode = render_mode
         self.rng = np.random.default_rng(seed)
-
-        # curriculum：默认固定半径（你也可以外部动态调）
-        self.curriculum_radius = float(cfg.get("curriculum", {}).get("radius", 0.25))
 
         xml_path = cfg["mj"].get("xml_path", None)
         if xml_path:
@@ -84,34 +81,9 @@ class KukaTableTennisEnv(gym.Env):
         obs_dim = base + rel + H * self.act_dim
         self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(obs_dim,), dtype=np.float32)
 
-        # --- bodies ---
-        try:
-            self.ball_body = self.data.body("ball")
-        except Exception as e:
-            raise RuntimeError("MuJoCo 模型里找不到 body: 'ball'") from e
+        self.ball_body = self.data.body("ball")
+        self.racket_body = self.data.body("tennis_racket")
 
-        try:
-            self.racket_body = self.data.body("tennis_racket")
-        except Exception as e:
-            raise RuntimeError("MuJoCo 模型里找不到 body: 'tennis_racket'。请确认 iiwa14_gantry.xml 里有该 body。") from e
-
-        # ✅ 0) 可靠的触球检测：使用 geom ID 白名单
-        self.ball_geom_id = mj.mj_name2id(self.model, mj.mjtObj.mjOBJ_GEOM, "ball_geom")
-        if self.ball_geom_id < 0:
-            raise RuntimeError("MuJoCo 模型里找不到 geom: 'ball_geom'")
-
-        racket_bid = mj.mj_name2id(self.model, mj.mjtObj.mjOBJ_BODY, "tennis_racket")
-        if racket_bid < 0:
-            raise RuntimeError("MuJoCo 模型里找不到 body id: 'tennis_racket'")
-
-        adr = int(self.model.body_geomadr[racket_bid])
-        num = int(self.model.body_geomnum[racket_bid])
-        if num <= 0:
-            raise RuntimeError("tennis_racket body 下没有任何 geom，无法做白名单触球检测。")
-
-        self.racket_geom_ids = set(range(adr, adr + num))
-
-        # table params
         tcfg = cfg["table"]
         self.table_center_x = float(tcfg["table_center_x"])
         self.table_half_len = float(tcfg["table_half_length"])
@@ -121,29 +93,16 @@ class KukaTableTennisEnv(gym.Env):
 
         self.max_steps = int(cfg["episode"]["max_steps"])
 
-        # gantry scaling
-        self.gantry_scale = float(cfg.get("control", {}).get("gantry_scale", 3.0))
-        self.gantry_div = float(cfg.get("control", {}).get("gantry_div", 60.0))
-        self.gantry_x_clip = cfg.get("control", {}).get("gantry_x_clip", [-1.0, 0.0])
-        self.gantry_y_clip = cfg.get("control", {}).get("gantry_y_clip", [-1.0, 1.0])
-
         self._init_episode_state()
 
     def _init_episode_state(self):
         self.step_count = 0
         self.hit_done = False
         self.prev_ball_pos = None
-
-        # 势能型奖励：cost = ||racket - target||^2
-        self.prev_cost = None
-        self.target_pos = None  # 当前 episode 的目标击球点
+        self.prev_dist = None
         self.self_side_is_x_less = True
 
-        # debug stats
-        self._last_term_reason = None
-
     def _reset_ball(self, pos3: np.ndarray, vel3: np.ndarray):
-        # 假设 ball freejoint 在 qpos/qvel 末尾
         self.data.qpos[-7:-4] = pos3
         self.data.qvel[-6:-3] = vel3
 
@@ -152,28 +111,24 @@ class KukaTableTennisEnv(gym.Env):
         vel = np.array(self.data.qvel[-6:-3], dtype=np.float32)
         return pos, vel
 
-    def _get_racket_state(self):
-        # xpos: 世界坐标下位置
-        racket_pos = np.array(self.racket_body.xpos, dtype=np.float32)
-        # cvel: 6D spatial velocity；在 MuJoCo 中通常是 [ang(3), lin(3)]（世界坐标）
-        # ✅ 修复关键点：线速度用 [3:6]，不是 [:3]
-        racket_vel = np.array(self.racket_body.cvel[3:6], dtype=np.float32)
-        return racket_pos, racket_vel
+    @staticmethod
+    def _is_racket_geom(name: str) -> bool:
+        n = name.lower()
+        return ("racket" in n) or ("paddle" in n) or ("bat" in n)
 
     def _detect_hit_racket(self) -> bool:
-        """✅ 使用 geom ID 白名单检测触球（更可靠）"""
         ncon = int(self.data.ncon)
         if ncon <= 0:
             return False
         for i in range(ncon):
             c = self.data.contact[i]
-            g1, g2 = int(c.geom1), int(c.geom2)
-            if (g1 == self.ball_geom_id and g2 in self.racket_geom_ids) or (g2 == self.ball_geom_id and g1 in self.racket_geom_ids):
+            g1 = mj.mj_id2name(self.model, mj.mjtObj.mjOBJ_GEOM, c.geom1)
+            g2 = mj.mj_id2name(self.model, mj.mjtObj.mjOBJ_GEOM, c.geom2)
+            if g1 is None or g2 is None:
+                continue
+            if ("ball_geom" in (g1, g2)) and (self._is_racket_geom(g1) or self._is_racket_geom(g2)):
                 return True
         return False
-
-    def set_curriculum_radius(self, radius: float):
-        self.curriculum_radius = float(radius)
 
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
@@ -181,15 +136,13 @@ class KukaTableTennisEnv(gym.Env):
         self._init_episode_state()
         self.prev_actions[...] = 0.0
 
-        # forward：获取球拍位置，判断己方在哪侧（给 sampler 用）
+        # forward 一次：获取球拍位置，判断己方在哪侧（给 sampler 用）
         mj.mj_forward(self.model, self.data)
-        racket_pos, racket_vel = self._get_racket_state()
-
-        racket_x = float(racket_pos[0])
+        racket_x = float(self.racket_body.xpos[0])
         self.self_side_is_x_less = (racket_x < self.net_x)
 
-        # 采样“必经球拍附近”的来球
-        pos0, vel0, p_hit = sample_hit_friendly(
+        # 采样“必经球拍附近”的来球（你自己保证这个 sampler 真的 hit-friendly）
+        pos0, vel0 = sample_hit_friendly(
             rng=self.rng,
             net_x=self.net_x,
             table_center_x=self.table_center_x,
@@ -197,21 +150,15 @@ class KukaTableTennisEnv(gym.Env):
             table_half_width=self.table_half_w,
             table_z=self.table_z,
             self_side_is_x_less=self.self_side_is_x_less,
-            racket_pos=racket_pos,
-            curriculum_radius=self.curriculum_radius,
         )
+        self._reset_ball(pos0, vel0)
 
-        self.target_pos = np.array(p_hit, dtype=np.float32).copy()
-        self._reset_ball(np.array(pos0, dtype=np.float32), np.array(vel0, dtype=np.float32))
-
-        # forward 一次同步接触/速度
         mj.mj_forward(self.model, self.data)
-
         ball_pos, ball_vel = self._get_ball_state()
-        racket_pos, racket_vel = self._get_racket_state()
-
         self.prev_ball_pos = ball_pos.copy()
-        self.prev_cost = float(np.sum((racket_pos - self.target_pos) ** 2))
+
+        racket_pos = np.array(self.racket_body.xpos, dtype=np.float32)
+        racket_vel = np.array(self.racket_body.cvel[:3], dtype=np.float32)
 
         obs = build_obs(
             qpos9=self.data.qpos[:9].copy(),
@@ -233,23 +180,22 @@ class KukaTableTennisEnv(gym.Env):
         self.prev_actions[:-1] = self.prev_actions[1:]
         self.prev_actions[-1] = action
 
-        # apply gantry (delta qpos)
-        self.data.qpos[0] += self.gantry_scale * float(action[0]) / self.gantry_div
-        self.data.qpos[1] += self.gantry_scale * float(action[1]) / self.gantry_div
-        self.data.qpos[0] = np.clip(self.data.qpos[0], float(self.gantry_x_clip[0]), float(self.gantry_x_clip[1]))
-        self.data.qpos[1] = np.clip(self.data.qpos[1], float(self.gantry_y_clip[0]), float(self.gantry_y_clip[1]))
+        # apply gantry
+        self.data.qpos[0] += 3.0 * float(action[0]) / 60.0
+        self.data.qpos[1] += 3.0 * float(action[1]) / 60.0
+        self.data.qpos[0] = np.clip(self.data.qpos[0], -1.0, 0.0)
+        self.data.qpos[1] = np.clip(self.data.qpos[1], -1.0, 1.0)
 
-        # joints: delta-pos -> ctrl target = qpos + delta
-        # 注意：确保你的模型 actuators 个数 == 7，且 ctrl 顺序对应 qpos[2:9]
+        # joints: delta-pos
         self.data.ctrl[:] = (action[2:] + self.data.qpos[2:9]).astype(np.float32)
 
         mj.mj_step(self.model, self.data)
         self.step_count += 1
 
         ball_pos, ball_vel = self._get_ball_state()
-        racket_pos, racket_vel = self._get_racket_state()
+        racket_pos = np.array(self.racket_body.xpos, dtype=np.float32)
+        racket_vel = np.array(self.racket_body.cvel[:3], dtype=np.float32)
 
-        # hit detect
         hit_racket = self._detect_hit_racket()
         hit_event = False
         if hit_racket and (not self.hit_done):
@@ -264,24 +210,19 @@ class KukaTableTennisEnv(gym.Env):
         reward += float(rcfg.get("alive", 0.0))
         reward -= float(rcfg.get("action_l2", 0.0)) * float(np.sum(action * action))
 
-        # 势能型进步奖励：到目标击球点的平方距离
-        cost_now = float(np.sum((racket_pos - self.target_pos) ** 2))
-        if self.prev_cost is not None:
-            progress = self.prev_cost - cost_now
-            reward += float(rcfg.get("racket_ball_prog", 3.0)) * progress
-        self.prev_cost = cost_now
+        # distance shaping (strong!)
+        dist = float(np.linalg.norm(ball_pos - racket_pos))
+        reward -= float(rcfg.get("racket_ball_dist", 0.08)) * dist
 
-        dist_to_target = float(np.sqrt(cost_now))
-        tolerance = float(rcfg.get("hit_tolerance", 0.08))
-        if dist_to_target < tolerance:
-            reward += float(rcfg.get("in_tolerance_bonus", 0.5))
+        # progress shaping (helps a lot)
+        if self.prev_dist is not None:
+            reward += float(rcfg.get("racket_ball_prog", 1.0)) * (self.prev_dist - dist)
+        self.prev_dist = dist
 
-        # 速度对齐：朝目标方向的速度分量（用线速度）
-        if dist_to_target > 1e-6:
-            rel = (self.target_pos - racket_pos)
-            rel_dir = rel / (float(np.linalg.norm(rel)) + 1e-6)
-            vel_align = float(np.dot(racket_vel, rel_dir))
-            reward += float(rcfg.get("racket_vel_align", 0.10)) * vel_align
+        # velocity alignment: encourage moving along line-of-sight to ball
+        rel = (ball_pos - racket_pos)
+        rel_dir = rel / (float(np.linalg.norm(rel)) + 1e-6)
+        reward += float(rcfg.get("racket_vel_align", 0.10)) * float(np.dot(racket_vel, rel_dir))
 
         # hit bonus (big)
         if hit_event:
@@ -290,25 +231,17 @@ class KukaTableTennisEnv(gym.Env):
         # -------- termination: Stage1 --------
         terminated = False
         truncated = False
-        term_reason = None
 
-        # 命中优先，永不被覆盖
         if hit_event:
-            terminated = True
-            term_reason = "hit"
+            terminated = True  # 关键：永远不会被后面覆盖
 
         # out-of-bounds / too long
         x, y, z = float(ball_pos[0]), float(ball_pos[1]), float(ball_pos[2])
-        oob = (x < OOB_X_MIN) or (x > OOB_X_MAX) or (abs(y) > OOB_Y_MAX) or (z < OOB_Z_MIN) or (z > OOB_Z_MAX)
-        if oob and (not terminated):
+        if (x < OOB_X_MIN) or (x > OOB_X_MAX) or (abs(y) > OOB_Y_MAX) or (z < OOB_Z_MIN) or (z > OOB_Z_MAX):
             terminated = True
-            term_reason = "oob"
 
-        if (self.step_count >= self.max_steps) and (not terminated):
+        if self.step_count >= self.max_steps:
             truncated = True
-            term_reason = "timeout"
-
-        self._last_term_reason = term_reason
 
         obs = build_obs(
             qpos9=self.data.qpos[:9].copy(),
@@ -321,28 +254,15 @@ class KukaTableTennisEnv(gym.Env):
             include_relative=bool(self.cfg["obs"]["include_relative"]),
         )
 
+        # 兼容 logger：只看 hit，其它全部固定 False，避免“清网>命中”这种统计鬼影
         info = {
             "hit": self.hit_done,
             "hit_event": hit_event,
-
-            # Stage1 固定为 False（避免日志混乱）
             "cleared_net": False,
             "landed": False,
             "landed_opponent": False,
             "success": False,
-
-            # debug/诊断关键字段
-            "term_reason": term_reason,
             "ball_pos": ball_pos.copy(),
-            "ball_vel": ball_vel.copy(),
-            "racket_pos": racket_pos.copy(),
-            "racket_vel": racket_vel.copy(),
-            "target_pos": self.target_pos.copy(),
-            "dist_to_target": dist_to_target,
-            "cost_now": cost_now,
-            "curriculum_radius": float(self.curriculum_radius),
-            "step_count": int(self.step_count),
         }
-
         self.prev_ball_pos = ball_pos.copy()
         return obs, float(reward), terminated, truncated, info
